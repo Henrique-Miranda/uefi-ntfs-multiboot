@@ -21,33 +21,32 @@
 #include <efistdarg.h>
 
 #define FILE_INFO_SIZE  (512 * sizeof(CHAR16))
-#define NUM_RETRIES     1
-#define DELAY           3	// delay before retry, in seconds
+#define NUM_RETRIES     4
+#define DELAY           1	// delay before retry, in seconds
+#define PAGE_SIZE       8
+#define AUTOBOOT_TIME   9
 
-EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = SIMPLE_FILE_SYSTEM_PROTOCOL;
-EFI_HANDLE EfiImageHandle = NULL;
+//EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = SIMPLE_FILE_SYSTEM_PROTOCOL;
+//EFI_HANDLE EfiImageHandle = NULL;
 // NB: FreePool(NULL) is perfectly valid
 #define SafeFree(p) do { FreePool(p); p = NULL;} while(0)
 
 // Use 'rufus' in the driver path, so that we don't accidentally latch onto a user driver
 #if defined(_M_X64) || defined(__x86_64__)
   static CHAR16* DriverPath = L"\\efi\\rufus\\ntfs_x64.efi";
+  static CHAR16* LoaderPath = L"\\efi\\boot\\bootx64.efi";
 #else
   static CHAR16* DriverPath = L"\\efi\\rufus\\ntfs_ia32.efi";
+  static CHAR16* LoaderPath = L"\\efi\\boot\\bootia32.efi";
 #endif
+
 // We'll need to fix the casing as our target is a case sensitive file system and Microsoft
 // indiscriminately seems to uses "EFI\Boot" or "efi\boot"
 #if defined(_M_X64) || defined(__x86_64__)
-  static CHAR16* LoaderPath = L"\\efi\\boot\\bootx64.efi";
 #else
-  static CHAR16* LoaderPath = L"\\efi\\boot\\bootia32.efi";
 #endif
-// Always good to know if we're actually running 32 or 64 bit
-#if defined(_M_X64) || defined(__x86_64__)
-  static CHAR16* Arch = L"64";
-#else
-  static CHAR16* Arch = L"32";
-#endif
+
+static CHAR8 NTFSMagic[] = { 'N', 'T', 'F', 'S', ' ', ' ', ' ', ' ' };
 
 // Display a human readable error message
 static VOID PrintStatusError(EFI_STATUS Status, const CHAR16 *Format, ...)
@@ -209,6 +208,69 @@ out:
 		FileHandle->Close(FileHandle);
 	FreePool((VOID*)FileInfo);
 	return Status;
+}
+
+
+typedef struct _LINKED_LOADER_PATH_LIST_NODE {
+    EFI_DEVICE_PATH *ldr;
+    struct _LINKED_LOADER_PATH_LIST_NODE *next;
+} LINKED_LOADER_PATH_LIST_NODE;
+
+VOID ListAppend(LINKED_LOADER_PATH_LIST_NODE **list, EFI_DEVICE_PATH *loader) {
+    LINKED_LOADER_PATH_LIST_NODE *node = *list;
+    if (node == NULL) {
+	node = *list = AllocateZeroPool(sizeof(LINKED_LOADER_PATH_LIST_NODE));
+    }
+    else {
+	while (node->next != NULL) node = node->next;
+	node->next = AllocateZeroPool(sizeof(LINKED_LOADER_PATH_LIST_NODE));
+	node = node->next;
+    }
+    node->ldr = loader;
+}
+
+VOID ListTraverse(LINKED_LOADER_PATH_LIST_NODE **list, VOID (*fun)(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx), UINTN start, UINTN count, VOID *ctx) {
+    LINKED_LOADER_PATH_LIST_NODE *node = *list;
+    UINTN index = 0;
+    while (node != NULL) {
+	if (index >= start) {
+	    if (!count || (index < (start + count))) {
+		fun(node->ldr, start, index, ctx);
+	    }
+	}
+	node = node->next;
+	index++;
+    }
+}
+
+VOID ListDestroy(LINKED_LOADER_PATH_LIST_NODE **list) {
+    LINKED_LOADER_PATH_LIST_NODE *node = *list;
+    while (node != NULL) {
+	LINKED_LOADER_PATH_LIST_NODE *prev = node;
+	node = node->next;
+	FreePool(prev);
+    }
+    *list = NULL;
+}
+
+VOID DisplayEntries(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx) {
+    EFI_DEVICE_PATH *pDevice = GetParentDevice(ldr);
+    CHAR16 *pszDevice = DevicePathToStr(GetLastDevicePath(pDevice));
+    Print(L"[%d] %s\n", index - slice + 1, pszDevice);
+    FreePool(pszDevice);
+    FreePool(pDevice);
+}
+
+VOID DestroyEntries(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx) {
+    FreePool(ldr);
+}
+
+VOID CountEntries(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx) {
+    (*(UINTN*)ctx)++;
+}
+
+VOID ReadEntry(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx) {
+    *((EFI_DEVICE_PATH**)ctx) = ldr;
 }
 
 // Application entrypoint
