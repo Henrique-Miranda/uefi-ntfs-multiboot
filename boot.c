@@ -212,205 +212,247 @@ out:
 }
 
 // Application entrypoint
-EFI_STATUS EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
 {
-	EFI_STATUS Status;
-	EFI_INPUT_KEY Key;
-	EFI_DEVICE_PATH *DevicePath, *ParentDevicePath = NULL, *USBDiskPath = NULL, *BootPartitionPath = NULL;
-	EFI_HANDLE *Handle = NULL, DriverHandle;
-	EFI_FILE_IO_INTERFACE* Volume;
-	EFI_FILE_HANDLE Root;
-	EFI_BLOCK_IO* BlockIo;
-	CHAR8 *Buffer, NTFSMagic[] = { 'N', 'T', 'F', 'S', ' ', ' ', ' ', ' '};
-	UINTN i, h, NumHandles = 0;
-	BOOLEAN SameDevice, NTFSPartition;
+    EFI_LOADED_IMAGE *pImage;
+    EFI_STATUS nStatus;
+    EFI_HANDLE hDriver, *hBlkDevs;
+    UINTN nBlkDevs;
+    EFI_DEVICE_PATH *pBootPart, *pBootDisk = NULL;
 
-	EfiImageHandle = ImageHandle;
-	InitializeLib(ImageHandle, SystemTable);
-	// Store the system table for future use in other functions
-	ST = SystemTable;
+    InitializeLib(hImage, pST);
+    Print(L"%H\n*** UEFI:NTFS multiboot ***");
 
-	Print(L"\n*** UEFI:NTFS (%s-bit) ***\n\n", Arch);
+    if (EFI_ERROR((nStatus = BS->OpenProtocol(hImage, &LoadedImageProtocol, &pImage, hImage, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL)))) {
+	Print(L"%E\nUnable to convert handle to interface: %r\n", nStatus);
+	goto end;
+    }
 
-	Print(L"Loading NTFS driver... ");
-	// Enumerate all file system handles, to locate our boot partition
-	Status = BS->LocateHandleBuffer(ByProtocol, &FileSystemProtocol, NULL, &NumHandles, &Handle);
-	if (EFI_ERROR(Status)) {
-		PrintStatusError(Status, L"\n  Failed to list file systems");
-		goto out;
-	}
+    pBootPart = DevicePathFromHandle(pImage->DeviceHandle);
+    pBootDisk = GetParentDevice(pBootPart);
 
-	for (h = 0; h < NumHandles; h++) {
-		// Look for our NTFS driver. Note: the path MUST be specified using backslashes!
-		DevicePath = FileDevicePath(Handle[h], DriverPath);
-		if (DevicePath == NULL)
-			continue;
+    CHAR16 *pszDev = DevicePathToStr(pBootDisk);
+    Print(L"%N\nDisk: %s\n\n", pszDev);
+    FreePool(pszDev);
 
-		// Attempt to load the driver. If that fails, it means we weren't on the right partition
-		Status = BS->LoadImage(FALSE, ImageHandle, DevicePath, NULL, 0, &DriverHandle);
-		SafeFree(DevicePath);
-		if (EFI_ERROR(Status))
-			continue;
+    Print(L"%H\r[ WAIT ] Loading NTFS driver");
+    EFI_DEVICE_PATH *pDrvPath = FileDevicePath(pImage->DeviceHandle, DriverPath);
+    if (pDrvPath == NULL) {
+	Print(L"%E\r[ FAIL ] Unable to construct path to NTFS driver\n");
+	goto end;
+    }
+    nStatus = BS->LoadImage(FALSE, hImage, pDrvPath, NULL, 0, &hDriver);
+    FreePool(pDrvPath);
+    if (EFI_ERROR(nStatus)) {
+	Print(L"%E\r[ FAIL ] Unable to load NTFS driver: %r\n", nStatus);
+	goto end;
+    }
+    if (EFI_ERROR((nStatus = BS->StartImage(hDriver, NULL, NULL)))) {
+	Print(L"%E\r[ FAIL ] Unable to start NTFS driver: %r\n", nStatus);
+	goto end;
+    }
+    Print(L"%H\r[  OK  ] NTFS driver loaded and started\n");
 
-		// Load was a success - attempt to start the driver
-		Status = BS->StartImage(DriverHandle, NULL, NULL);
-		if (EFI_ERROR(Status)) {
-			PrintStatusError(Status, L"\n  Driver did not start");
-			goto out;
-		}
+    LINKED_LOADER_PATH_LIST_NODE *list = NULL;
+    EFI_DEVICE_PATH *ldr;
 
-		// Keep track of our boot partition as well as the parent disk as we need these
-		// to locate the NTFS partition on the same device
-		BootPartitionPath = DevicePathFromHandle(Handle[h]);
-		USBDiskPath = GetParentDevice(BootPartitionPath);
+    if (EFI_ERROR((nStatus = BS->LocateHandleBuffer(ByProtocol, &BlockIoProtocol, NULL, &nBlkDevs, &hBlkDevs)))) {
+	Print(L"%E\r[ FAIL ] Unable to enumerate block devices: %r\n", nStatus);
+	goto end;
+    }
+    for (UINTN i = 0; i < nBlkDevs; i++) {
+	EFI_DEVICE_PATH *pDevice = DevicePathFromHandle(hBlkDevs[i]);
+	pszDev = DevicePathToStr(pDevice);
+	Print(L"%N\r[ INFO ] Probing %d devices... [%d] %s", nBlkDevs, i + 1, pszDev);
+	FreePool(pszDev);
 
-		break;
-	}
-	SafeFree(Handle);
+	if (CompareDevicePaths(pDevice, pBootPart) == 0) continue;
+	if (CompareDevicePaths(pDevice, pBootDisk) == 0) continue;
 
-	if (h >= NumHandles) {
-		Print(L"\n  Failed to locate driver. Please check that '%s' exists on the FAT partition", DriverPath);
-		Status = EFI_NOT_FOUND;
-		goto out;
-	}
-	Print(L"DONE\nLocating the first NTFS partition on this device... ");
-
-	// Now enumerate all disk handles
-	Status = BS->LocateHandleBuffer(ByProtocol, &DiskIoProtocol, NULL, &NumHandles, &Handle);
-	if (EFI_ERROR(Status)) {
-		PrintStatusError(Status, L"\n  Failed to list disks");
-		goto out;
-	}
-
-	// Go through the partitions and find the one that has the USB Disk we booted from
-	// as parent and that isn't the FAT32 boot partition
-	for (h = 0; h < NumHandles; h++) {
-		// Note: The Device Path obtained from DevicePathFromHandle() should NOT be freed!
-		DevicePath = DevicePathFromHandle(Handle[h]);
-		// Eliminate the partition we booted from
-		if (CompareDevicePaths(DevicePath, BootPartitionPath) == 0)
-			continue;
-		// Ensure that we look for the NTFS partition on the same device.
-		ParentDevicePath = GetParentDevice(DevicePath);
-		SameDevice = (CompareDevicePaths(USBDiskPath, ParentDevicePath) == 0);
-		SafeFree(ParentDevicePath);
-		// The check breaks QEMU testing (since we can't easily emulate
-		// a multipart device on the fly) so only do it for release.
+	EFI_DEVICE_PATH *pDisk = GetParentDevice(pDevice);
+	_Bool probe = CompareDevicePaths(pDisk, pBootDisk) == 0;
+	FreePool(pDisk);
 #if !defined(_DEBUG)
-		if (!SameDevice)
-			continue;
+	if (!probe) continue;
+#else
+	UNREFERENCED(probe);
 #endif
-		// Read the first block of the partition and look for the NTFS magic in the OEM ID
-		Status = BS->OpenProtocol(Handle[h], &BlockIoProtocol, (VOID**) &BlockIo,
-			EfiImageHandle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-		if (EFI_ERROR(Status))
-			continue;
-		Buffer = (CHAR8*)AllocatePool(BlockIo->Media->BlockSize);
-		if (Buffer == NULL)
-			continue;
-		Status = BlockIo->ReadBlocks(BlockIo, BlockIo->Media->MediaId, 0, BlockIo->Media->BlockSize, Buffer);
-		NTFSPartition = (CompareMem(&Buffer[3], NTFSMagic, sizeof(NTFSMagic)) == 0);
-		FreePool(Buffer);
-		if (EFI_ERROR(Status))
-			continue;
-		if (NTFSPartition)
+
+	EFI_BLOCK_IO *blkIo;
+	if (EFI_ERROR((nStatus = BS->OpenProtocol(hBlkDevs[i], &BlockIoProtocol, &blkIo, hImage, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL)))) {
+	    Print(L"%E\n[ WARN ] Unable to open block device, skipping: %r\n", nStatus);
+	    continue;
+	}
+
+	CHAR8 *buffer = AllocatePool(blkIo->Media->BlockSize);
+	if (buffer == NULL) {
+	    Print(L"%E\n[ WARN ] Unable to allocate buffer of size %d\n", blkIo->Media->BlockSize);
+	    continue;
+	}
+
+	nStatus = blkIo->ReadBlocks(blkIo, blkIo->Media->MediaId, 0, blkIo->Media->BlockSize, buffer);
+	_Bool isNTFS = CompareMem(&buffer[3], NTFSMagic, sizeof(NTFSMagic)) == 0;
+	FreePool(buffer);
+	if (EFI_ERROR(nStatus)) {
+	    Print(L"%E\n[ WARN ] Unable to read block device, skipping: %r\n", nStatus);
+	    continue;
+	}
+	if (!isNTFS) continue;
+
+	Print(L"%H\n[ WAIT ] Attaching NTFS driver to device");
+	EFI_FILE_IO_INTERFACE *fs;
+	nStatus = BS->OpenProtocol(hBlkDevs[i], &FileSystemProtocol, NULL, hImage, NULL, EFI_OPEN_PROTOCOL_TEST_PROTOCOL);
+	if (nStatus == EFI_UNSUPPORTED) {
+	    nStatus = BS->ConnectController(hBlkDevs[i], NULL, NULL, TRUE);
+	}
+	for (UINTN j = 0; j < NUM_RETRIES; j++) {
+	    if ((!EFI_ERROR((nStatus = BS->OpenProtocol(hBlkDevs[i], &FileSystemProtocol, &fs, hImage, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL))))) {
+		break;
+	    }
+	    Print(L".");
+	    BS->Stall(DELAY * 1000000);
+	}
+	if(EFI_ERROR(nStatus)) {
+	    Print(L"%E\r[ WARN ] Unable to attach NTFS driver, skipping: %r\n", nStatus);
+	    continue;
+	}
+	Print(L"%H\r[  OK  ] NTFS driver attached to current device\n");
+
+	Print(L"%H\r[ WAIT ] Locating EFI boot loader");
+	EFI_FILE *fsRoot;
+	if (EFI_ERROR((nStatus = fs->OpenVolume(fs, &fsRoot)))) {
+	    Print(L"%E\r[ WARN ] Unable to open root directory, skipping: %r\n", nStatus);
+	    continue;
+	}
+	CHAR16 *loader = StrDuplicate(LoaderPath);
+	if (EFI_ERROR((nStatus = SetPathCase(fsRoot, loader)))) {
+	    FreePool(loader);
+	    Print(L"%E\r[ WARN ] Unable to locate EFI boot loader on this device: %r\n", nStatus);
+	    continue;
+	}
+	Print(L"%H\r[  OK  ] EFI boot loader located at %s\n", loader);
+
+	ldr = FileDevicePath(hBlkDevs[i], loader);
+	ListAppend(&list, ldr);
+	FreePool(loader);
+    }
+
+    UINTN nListEntries = 0, nBootEntry = 0, nPage = 0, nTotalPage = 0;
+    EFI_INPUT_KEY key;
+    _Bool interactive = FALSE;
+    ListTraverse(&list, CountEntries, 0, 0, &nListEntries);
+
+    switch (nListEntries) {
+    case 0:
+	Print(L"%E\n[ FAIL ] No bootable partition\n", nStatus);
+	nStatus = EFI_NOT_FOUND;
+	goto end;
+    case 1:
+	//break;
+    default:
+	nTotalPage = (nListEntries - 1) / PAGE_SIZE + 1;
+	while (1) {
+	    ST->ConOut->ClearScreen(ST->ConOut);
+	    Print(L"%H*** UEFI:NTFS Multiboot ***\n");
+	    CHAR16 *pszDev = DevicePathToStr(pBootDisk);
+	    Print(L"%NDisk: %s\n\n%H", pszDev);
+	    FreePool(pszDev);
+
+	    ListTraverse(&list, DisplayEntries, nPage * PAGE_SIZE, PAGE_SIZE, NULL);
+
+	    Print(L"%N\nPage %hd / %hd, %hd entries\n", nPage + 1, nTotalPage, nListEntries);
+	    Print(L"%H\n[F1 - F8] [1 - 8] %N Boot corresponding entry");
+	    Print(L"%H\n[PgUp]  [<]  [-]  %N Previous page");
+	    Print(L"%H\n[PgDn]  [>]  [+]  %N Next page");
+
+	    if (!interactive) {
+		INTN nCountDown = AUTOBOOT_TIME;
+		Print(L"%N\n\n");
+		while (nCountDown >= 0) {
+		    Print(L"\rWill automatically boot the first entry in %d seconds...", nCountDown);
+		    if (WaitForSingleEvent(ST->ConIn->WaitForKey, 1000 * 1000 * 10) != EFI_TIMEOUT) {
+			interactive = TRUE;
 			break;
-	}
-
-	if (h >= NumHandles) {
-		Print(L"\n  ERROR: NTFS partition was not found.\n");
-		Status = EFI_NOT_FOUND;
-		goto out;
-	}
-
-	Print(L"DONE\nCheck if partition needs the NTFS driver service... ");
-	// Test for presence of file system protocol (to see if there already is
-	// an NTFS driver servicing this partition)
-	Status = BS->OpenProtocol(Handle[h], &FileSystemProtocol, (VOID**)&Volume,
-		EfiImageHandle, NULL, EFI_OPEN_PROTOCOL_TEST_PROTOCOL);
-	if (Status == EFI_SUCCESS) {
-		// An NTFS driver is already set => no need to start ours
-		Print(L"NOPE\n");
-	} else if (Status == EFI_UNSUPPORTED) {
-		// Partition is not being serviced by a file system driver yet => start ours
-		Print(L"DONE\nStarting NTFS driver service... ");
-		// Calling ConnectController() on a handle starts all the drivers that can service it
-		Status = BS->ConnectController(Handle[h], NULL, NULL, TRUE);
-		if (EFI_ERROR(Status)) {
-			PrintStatusError(Status, L"\n  ERROR: Could not start NTFS service");
-			goto out;
+		    }
+		    nCountDown--;
 		}
-		Print(L"DONE\n");
-	} else {
-		PrintStatusError(Status, L"\n  ERROR: Could not check for NTFS service");
-		goto out;
+		if (!interactive) {
+		    goto boot;
+		}
+	    }
+	    else {
+		WaitForSingleEvent(ST->ConIn->WaitForKey, 0);
+	    }
+	    ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
+	    switch (key.UnicodeChar) {
+	    case L'1':case L'2':case L'3':case L'4':case L'5':case L'6':case L'7':case L'8':
+		nBootEntry = nPage * PAGE_SIZE + (key.UnicodeChar - L'1');
+		goto boot;
+	    case L'+':case L'=':case L'>':case L'.':
+		if ((nPage + 1) != nTotalPage) {
+		    nPage++;
+		}
+		break;
+	    case L'-':case L'_': case L'<': case L',':
+		if (nPage != 0) {
+		    nPage--;
+		}
+		break;
+	    default:
+		switch (key.ScanCode) {
+		case 0x09:
+		    if (nPage != 0) {
+			nPage--;
+		    }
+		    break;
+		case 0x0a:
+		    if ((nPage + 1) != nTotalPage) {
+			nPage++;
+		    }
+		    break;
+		case 0x0b:case 0x0c:case 0x0d:case 0x0e:case 0x0f:case 0x10:case 0x11:case 0x12:
+		    nBootEntry = nPage * PAGE_SIZE + (key.ScanCode - 0x0b);
+		    goto boot;
+		}
+	    }
 	}
+    }
 
-	// Our target file system is case sensitive, so we need to figure out the
-	// case sensitive version of LoaderPath
+boot:
+    ldr = NULL;
+    Print(L"%H");
+    ST->ConOut->ClearScreen(ST->ConOut);
+    ListTraverse(&list, ReadEntry, nBootEntry, 1, &ldr);
+    ListTraverse(&list, DisplayEntries, nBootEntry, 1, NULL);
+    if (ldr == NULL) {
+	Print(L"%E\n[ FAIL ] No such boot entry\n", nStatus);
+	nStatus = EFI_NOT_FOUND;
+	goto end;
+    }
 
-	// Open the the volume, with retry, as we may need to wait before poking
-	// at the NTFS content, in case the system is slow to start our service...
-	for (i = 0; ; i++) {
-		Print(L"Looking for NTFS EFI loader... ");
-		Status = BS->OpenProtocol(Handle[h], &FileSystemProtocol, (VOID**)&Volume,
-			EfiImageHandle, NULL, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL);
-		if (!EFI_ERROR(Status))
-			break;
-		PrintStatusError(Status, L"\n  ERROR: Could not open NTFS volume");
-		if (i >= NUM_RETRIES)
-			goto out;
-		Print(L"  Waiting %d seconds before retrying... ", DELAY);
-		BS->Stall(DELAY * 1000000);
-		Print(L"DONE\n");
-	}
+    ldr = DuplicateDevicePath(ldr);
+    ListTraverse(&list, DestroyEntries, 0, 0, NULL);
+    ListDestroy(&list);
 
-	// Open the root directory
-	Root = NULL;
-	Status = Volume->OpenVolume(Volume, &Root);
-	if ((EFI_ERROR(Status)) || (Root == NULL)) {
-		PrintStatusError(Status, L"\n  Could not open Root directory");
-		goto out;
-	}
+    EFI_HANDLE hChain;
+    nStatus = BS->LoadImage(FALSE, hImage, ldr, NULL, 0, &hChain);
+    FreePool(ldr);
+    if (EFI_ERROR(nStatus)) {
+	Print(L"%E\n[ FAIL ] Unable to load boot loader: %r\n", nStatus);
+	goto end;
+    }
+    Print(L"%N");
+    if (EFI_ERROR((nStatus = BS->StartImage(hChain, NULL, NULL)))) {
+	Print(L"%E\n[ FAIL ] Unable to start boot loader: %r\n", nStatus);
+	goto end;
+    }
 
-	// This next call will correct the casing to the required one
-	Status = SetPathCase(Root, LoaderPath);
-	if (EFI_ERROR(Status)) {
-		PrintStatusError(Status, L"\n  ERROR: Could not locate '%s'", LoaderPath);
-		goto out;
-	}
-
-	// At this stage, our DevicePath is the partition we are after
-	Print(L"DONE\nLaunching NTFS EFI loader '%s'...\n\n", &LoaderPath[1]);
-
-	// Now attempt to chain load bootx64.efi on the NTFS partition
-	DevicePath = FileDevicePath(Handle[h], LoaderPath);
-	if (DevicePath == NULL) {
-		Print(L"  ERROR: Failed to create path\n");
-		goto out;
-	}
-	Status = BS->LoadImage(FALSE, ImageHandle, DevicePath, NULL, 0, &DriverHandle);
-	SafeFree(DevicePath);
-	if (EFI_ERROR(Status)) {
-		PrintStatusError(Status, L"  Load failure");
-		goto out;
-	}
-
-	Status = BS->StartImage(DriverHandle, NULL, NULL);
-	if (EFI_ERROR(Status))
-		PrintStatusError(Status, L"  Start failure");
-
-out:
-	SafeFree(ParentDevicePath);
-	SafeFree(USBDiskPath);
-	SafeFree(Handle);
-
-	// Wait for a keystroke on error
-	if (EFI_ERROR(Status)) {
-		Print(L"\nPress any key to exit.\n");
-		ST->ConIn->Reset(ST->ConIn, FALSE);
-		while (ST->ConIn->ReadKeyStroke(ST->ConIn, &Key) == EFI_NOT_READY);
-	}
-
-	return Status;
+end:
+    if (pBootDisk) FreePool(pBootDisk);
+    if (EFI_ERROR(nStatus)) {
+	Print(L"Press any key to exit\n");
+	WaitForSingleEvent(ST->ConIn->WaitForKey, 0);
+	ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
+    }
+    return nStatus;
 }
