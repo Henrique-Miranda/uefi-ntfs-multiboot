@@ -26,12 +26,9 @@
 #define PAGE_SIZE       8
 #define AUTOBOOT_TIME   9
 
-//EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = SIMPLE_FILE_SYSTEM_PROTOCOL;
-//EFI_HANDLE EfiImageHandle = NULL;
-// NB: FreePool(NULL) is perfectly valid
-#define SafeFree(p) do { FreePool(p); p = NULL;} while(0)
-
 // Use 'rufus' in the driver path, so that we don't accidentally latch onto a user driver
+// We'll need to fix the casing as our target is a case sensitive file system and Microsoft
+// indiscriminately seems to uses "EFI\Boot" or "efi\boot"
 #if defined(_M_X64) || defined(__x86_64__)
   static CHAR16* DriverPath = L"\\efi\\rufus\\ntfs_x64.efi";
   static CHAR16* LoaderPath = L"\\efi\\boot\\bootx64.efi";
@@ -40,26 +37,7 @@
   static CHAR16* LoaderPath = L"\\efi\\boot\\bootia32.efi";
 #endif
 
-// We'll need to fix the casing as our target is a case sensitive file system and Microsoft
-// indiscriminately seems to uses "EFI\Boot" or "efi\boot"
-#if defined(_M_X64) || defined(__x86_64__)
-#else
-#endif
-
 static CHAR8 NTFSMagic[] = { 'N', 'T', 'F', 'S', ' ', ' ', ' ', ' ' };
-
-// Display a human readable error message
-static VOID PrintStatusError(EFI_STATUS Status, const CHAR16 *Format, ...)
-{
-	CHAR16 StatusString[64];
-	va_list ap;
-
-	StatusToString(StatusString, Status);
-	va_start(ap, Format);
-	VPrint((CHAR16 *)Format, ap);
-	va_end(ap);
-	Print(L": [%d] %s\n", (Status & 0x7FFFFFFF), StatusString);
-}
 
 // Return the device path node right before the end node
 static EFI_DEVICE_PATH* GetLastDevicePath(const EFI_DEVICE_PATH* dp)
@@ -211,6 +189,7 @@ out:
 }
 
 
+
 typedef struct _LINKED_LOADER_PATH_LIST_NODE {
     EFI_DEVICE_PATH *ldr;
     struct _LINKED_LOADER_PATH_LIST_NODE *next;
@@ -273,7 +252,6 @@ VOID ReadEntry(EFI_DEVICE_PATH *ldr, UINTN slice, UINTN index, VOID *ctx) {
     *((EFI_DEVICE_PATH**)ctx) = ldr;
 }
 
-// Application entrypoint
 EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
 {
     EFI_LOADED_IMAGE *pImage;
@@ -336,8 +314,6 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
 	FreePool(pDisk);
 #if !defined(_DEBUG)
 	if (!probe) continue;
-#else
-	UNREFERENCED(probe);
 #endif
 
 	EFI_BLOCK_IO *blkIo;
@@ -416,7 +392,7 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
 	while (1) {
 	    ST->ConOut->ClearScreen(ST->ConOut);
 	    Print(L"%H*** UEFI:NTFS Multiboot ***\n");
-	    CHAR16 *pszDev = DevicePathToStr(pBootDisk);
+	    pszDev = DevicePathToStr(pBootDisk);
 	    Print(L"%NDisk: %s\n\n%H", pszDev);
 	    FreePool(pszDev);
 
