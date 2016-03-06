@@ -386,7 +386,7 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
 	nStatus = EFI_NOT_FOUND;
 	goto end;
     case 1:
-	//break;
+	goto boot;
     default:
 	nTotalPage = (nListEntries - 1) / PAGE_SIZE + 1;
 	while (1) {
