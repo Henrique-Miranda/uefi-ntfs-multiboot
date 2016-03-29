@@ -171,14 +171,14 @@ static EFI_STATUS SetPathCase(EFI_FILE_HANDLE Root, CHAR16* Path)
 		Size = FILE_INFO_SIZE;
 		Status = FileHandle->Read(FileHandle, &Size, (VOID*)FileInfo);
 		if (EFI_ERROR(Status))
-			goto out;
+			break;
 		if (_StriCmp(&Path[i+1], FileInfo->FileName) == 0) {
 			StrCpy(&Path[i+1], FileInfo->FileName);
 			Status = EFI_SUCCESS;
-			goto out;
+			break;
 		}
 		Status = EFI_NOT_FOUND;
-	} while (FileInfo->FileName[0] != 0);
+	} while (Size != 0);
 
 out:
 	Path[i] = L'\\';
