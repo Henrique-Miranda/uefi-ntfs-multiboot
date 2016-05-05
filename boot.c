@@ -39,9 +39,10 @@
 #endif
 
 static CHAR8 NTFSMagic[] = { 'N', 'T', 'F', 'S', ' ', ' ', ' ', ' ' };
+EFI_HANDLE g_hImage = NULL;
 
 // Return the device path node right before the end node
-static EFI_DEVICE_PATH* GetLastDevicePath(const EFI_DEVICE_PATH* dp)
+static EFI_DEVICE_PATH* GetLastDevicePath(CONST EFI_DEVICE_PATH* dp)
 {
     EFI_DEVICE_PATH *next, *p;
 
@@ -57,7 +58,7 @@ static EFI_DEVICE_PATH* GetLastDevicePath(const EFI_DEVICE_PATH* dp)
 
 // Get the parent device in an EFI_DEVICE_PATH
 // Note: the returned device path is allocated and must be freed
-static EFI_DEVICE_PATH* GetParentDevice(const EFI_DEVICE_PATH* DevicePath)
+static EFI_DEVICE_PATH* GetParentDevice(CONST EFI_DEVICE_PATH* DevicePath)
 {
     EFI_DEVICE_PATH *dp, *ldp;
 
@@ -78,7 +79,7 @@ static EFI_DEVICE_PATH* GetParentDevice(const EFI_DEVICE_PATH* DevicePath)
 }
 
 // Compare device paths
-static INTN CompareDevicePaths(const EFI_DEVICE_PATH *dp1, const EFI_DEVICE_PATH *dp2)
+static INTN CompareDevicePaths(CONST EFI_DEVICE_PATH *dp1, CONST EFI_DEVICE_PATH *dp2)
 {
     if (dp1 == NULL || dp2 == NULL)
         return -1;
@@ -122,22 +123,22 @@ static INTN CompareDevicePaths(const EFI_DEVICE_PATH *dp1, const EFI_DEVICE_PATH
 
 // Some UEFI firmwares have a *BROKEN* Unicode collation implementation
 // so we must provide our own version of StriCmp for ASCII comparison...
-static CHAR16 _tolower(CHAR16 c)
+static CHAR16 _tolower(CONST CHAR16 c)
 {
     if(('A' <= c) && (c <= 'Z'))
         return 'a' + (c - 'A');
     return c;
 }
 
-static int _StriCmp(CONST CHAR16 *s1, CONST CHAR16 *s2)
+static INTN _StriCmp(CONST CHAR16 *s1, CONST CHAR16 *s2)
 {
     while ((*s1 != L'\0') && (_tolower(*s1) == _tolower(*s2)))
         s1++, s2++;
-    return (int)(*s1 - *s2);
+    return (INTN)(*s1 - *s2);
 }
 
 // Fix the case of a path by looking it up on the file system
-static EFI_STATUS SetPathCase(EFI_FILE_HANDLE Root, CHAR16* Path)
+static EFI_STATUS SetPathCase(CONST EFI_FILE_HANDLE Root, CHAR16* Path)
 {
     EFI_FILE_HANDLE FileHandle = NULL;
     EFI_FILE_INFO* FileInfo;
@@ -189,27 +190,48 @@ out:
     return Status;
 }
 
+/* Get the driver name from a driver handle */
+static CHAR16* GetDriverName(CONST EFI_HANDLE DriverHandle)
+{
+    CHAR16 *DriverName;
+    EFI_COMPONENT_NAME *ComponentName;
+    EFI_COMPONENT_NAME2 *ComponentName2;
+
+    // Try EFI_COMPONENT_NAME2 protocol first
+    if ((BS->OpenProtocol(DriverHandle, &ComponentName2Protocol, (VOID**)&ComponentName2,
+        g_hImage, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL) == EFI_SUCCESS) &&
+        (ComponentName2->GetDriverName(ComponentName2, "", &DriverName) == EFI_SUCCESS))
+        return DriverName;
+
+    // Fallback to EFI_COMPONENT_NAME if that didn't work
+    if ((BS->OpenProtocol(DriverHandle, &ComponentNameProtocol, (VOID**)&ComponentName,
+        g_hImage, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL) == EFI_SUCCESS) &&
+        (ComponentName->GetDriverName(ComponentName, "", &DriverName) == EFI_SUCCESS))
+        return DriverName;
+
+    return L"(unknown driver)";
+}
+
 /*
 * Some UEFI firmwares (like HPQ EFI from HP notebooks) have DiskIo protocols
 * opened BY_DRIVER (by Partition driver in HP case) even when no file system
 * is produced from this DiskIo. This then blocks our FS driver from connecting
 * and producing file systems.
-* To fix it: We disconnect drivers that connected to DiskIo BY_DRIVER if this
-* is a partition volume and if those drivers did not produce file system,
-* then try to connect every unconnected device to the driver whose handle is
-* passed to us.
+* To fix it we disconnect drivers that connected to DiskIo BY_DRIVER if this
+* is a partition volume and if those drivers did not produce file system.
 */
-VOID ConnectFilesystemDriver(EFI_HANDLE DriverHandle) {
+static VOID DisconnectBlockingDrivers(VOID) {
     EFI_STATUS Status;
     UINTN HandleCount = 0, Index, OpenInfoIndex, OpenInfoCount;
-    EFI_HANDLE *Handles = NULL, DriverHandleList[2];
+    EFI_HANDLE *Handles = NULL;
+    CHAR16 *DevicePathString;
     EFI_FILE_IO_INTERFACE *Volume;
     EFI_BLOCK_IO *BlockIo;
     EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *OpenInfo;
 
     // Get all DiskIo handles
     Status = BS->LocateHandleBuffer(ByProtocol, &DiskIoProtocol, NULL, &HandleCount, &Handles);
-    if (EFI_ERROR(Status) || HandleCount == 0)
+    if (EFI_ERROR(Status) || (HandleCount == 0))
         return;
 
     // Check every DiskIo handle
@@ -221,7 +243,7 @@ VOID ConnectFilesystemDriver(EFI_HANDLE DriverHandle) {
         Status = BS->HandleProtocol(Handles[Index], &BlockIoProtocol, (VOID **)&BlockIo);
         if (EFI_ERROR(Status))
             continue;
-        if (BlockIo->Media == NULL || !BlockIo->Media->LogicalPartition)
+        if ((BlockIo->Media == NULL) || (!BlockIo->Media->LogicalPartition))
             continue;
 
         // If SimpleFileSystem is already produced - skip it, this is ok
@@ -229,18 +251,28 @@ VOID ConnectFilesystemDriver(EFI_HANDLE DriverHandle) {
         if (Status == EFI_SUCCESS)
             continue;
 
+        DevicePathString = DevicePathToStr(DevicePathFromHandle(Handles[Index]));
+        Print(L"%N\r[ INFO ] Probing %d devices... [%d] %s", HandleCount, Index + 1, DevicePathString);
+        FreePool(DevicePathString);
+
         // If no SimpleFileSystem on this handle but DiskIo is opened BY_DRIVER
-        // then disconnect this connection and try to connect our driver to it
+        // then disconnect this connection
         Status = BS->OpenProtocolInformation(Handles[Index], &DiskIoProtocol, &OpenInfo, &OpenInfoCount);
-        if (EFI_ERROR(Status))
+        if (EFI_ERROR(Status)) {
+            Print(L"%H\n[ WARN ] Could not get DiskIo protocol: %r\n", Status);
+            FreePool(DevicePathString);
             continue;
-        DriverHandleList[1] = NULL;
+        }
+
+        if (OpenInfoCount > 0)
+            Print(L"%N\n[ INFO ] Disconnecting %d drivers...", OpenInfoCount);
+
         for (OpenInfoIndex = 0; OpenInfoIndex < OpenInfoCount; OpenInfoIndex++) {
             if ((OpenInfo[OpenInfoIndex].Attributes & EFI_OPEN_PROTOCOL_BY_DRIVER) == EFI_OPEN_PROTOCOL_BY_DRIVER) {
+                Print(L"%N\r[ INFO ] Disconnecting %d drivers... [%d] %s", OpenInfoCount, OpenInfoIndex+1, GetDriverName(OpenInfo[OpenInfoIndex].AgentHandle));
                 Status = BS->DisconnectController(Handles[Index], OpenInfo[OpenInfoIndex].AgentHandle, NULL);
-                if (!(EFI_ERROR(Status))) {
-                    DriverHandleList[0] = DriverHandle;
-                    BS->ConnectController(Handles[Index], DriverHandleList, NULL, FALSE);
+                if (EFI_ERROR(Status)) {
+                    Print(L"%H\n[ WARN ] Could not disconnect driver: %r\n", Status);
                 }
             }
         }
@@ -319,6 +351,7 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
     UINTN nBlkDevs;
     EFI_DEVICE_PATH *pBootPart, *pBootDisk = NULL;
 
+    g_hImage = hImage;
     InitializeLib(hImage, pST);
     Print(L"%H\n*** UEFI:NTFS multiboot ***");
 
@@ -331,10 +364,13 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
     pBootDisk = GetParentDevice(pBootPart);
 
     CHAR16 *pszDev = DevicePathToStr(pBootDisk);
-    Print(L"%N\nDisk: %s\n\n", pszDev);
+    Print(L"%N\nDisk: %s\n", pszDev);
     FreePool(pszDev);
 
-    Print(L"%H\r[ WAIT ] Loading NTFS driver");
+    Print(L"%H\n[ INFO ] Disconnecting problematic File System drivers\n");
+    DisconnectBlockingDrivers();
+
+    Print(L"%H\n[ WAIT ] Loading NTFS driver");
     EFI_DEVICE_PATH *pDrvPath = FileDevicePath(pImage->DeviceHandle, DriverPath);
     if (pDrvPath == NULL) {
         Print(L"%E\r[ FAIL ] Unable to construct path to NTFS driver\n");
@@ -351,8 +387,6 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
         goto end;
     }
 
-    Print(L"%H\r[ WAIT ] Reconnecting File System drivers");
-    ConnectFilesystemDriver(hDriver);
     Print(L"%H\r[  OK  ] NTFS driver loaded and started\n");
 
     LINKED_LOADER_PATH_LIST_NODE *list = NULL;
@@ -383,6 +417,10 @@ EFI_STATUS EfiMain(EFI_HANDLE hImage, EFI_SYSTEM_TABLE *pST)
             Print(L"%E\n[ WARN ] Unable to open block device, skipping: %r\n", nStatus);
             continue;
         }
+
+        //No media or not a partition.
+        if ((blkIo->Media == NULL) || (!blkIo->Media->LogicalPartition))
+            continue;
 
         CHAR8 *buffer = AllocatePool(blkIo->Media->BlockSize);
         if (buffer == NULL) {
