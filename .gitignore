@@ -4,6 +4,8 @@
 *.sdf
 *.suo
 *.opensdf
+*.VC.db
+*.VC.opendb
 x64
 OVMF.fd
 image
